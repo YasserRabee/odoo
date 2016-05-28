@@ -123,7 +123,7 @@ class project_issue(osv.Model):
         if project_id:
             project = self.pool.get('project.project').browse(cr, uid, project_id, context=context)
             if project and project.partner_id:
-                return {'value': {'partner_id': project.partner_id.id}}
+                return {'value': {'partner_id': project.partner_id.id, 'email_from': project.partner_id.email}}
         return {}
 
     _columns = {
@@ -450,7 +450,7 @@ class project(osv.Model):
     def _issue_count(self, cr, uid, ids, field_name, arg, context=None):
         Issue = self.pool['project.issue']
         return {
-            project_id: Issue.search_count(cr,uid, [('project_id', '=', project_id), ('stage_id.fold', '=', False)], context=context)
+            project_id: Issue.search_count(cr,uid, [('project_id', '=', project_id), '|', ('stage_id.fold', '=', False), ('stage_id', '=', False)], context=context)
             for project_id in ids
         }
 
@@ -464,7 +464,7 @@ class project(osv.Model):
     _columns = {
         'issue_count': fields.function(_issue_count, type='integer', string="Issues",),
         'issue_ids': fields.one2many('project.issue', 'project_id', string="Issues",
-                                    domain=[('stage_id.fold', '=', False)]),
+                                    domain=['|', ('stage_id.fold', '=', False), ('stage_id', '=', False)]),
         'issue_needaction_count': fields.function(_issue_needaction_count, type='integer', string="Issues",),
     }
 
@@ -546,9 +546,10 @@ class project_project(osv.Model):
 class res_partner(osv.osv):
     def _issue_count(self, cr, uid, ids, field_name, arg, context=None):
         Issue = self.pool['project.issue']
+        partners = {id: self.search(cr, uid, [('id', 'child_of', ids)]) for id in ids}
         return {
-            partner_id: Issue.search_count(cr,uid, [('partner_id', '=', partner_id)])
-            for partner_id in ids
+            partner_id: Issue.search_count(cr, uid, [('partner_id', 'in', partners[partner_id])])
+            for partner_id in partners.keys()
         }
 
     """ Inherits partner and adds Issue information in the partner form """

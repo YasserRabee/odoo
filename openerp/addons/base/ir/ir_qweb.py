@@ -264,13 +264,6 @@ class QWeb(orm.AbstractModel):
             else:
                 _logger.warning("@t-debug in template '%s' is only available in --dev mode" % qwebcontext['__template__'])
 
-        # remove branding attributes from inherit
-        if element.attrib.get('data-oe-id') and [key for key in element.attrib.keys() if key.startswith("t-")]:
-            element.attrib.pop("data-oe-id", False)
-            element.attrib.pop("data-oe-xpath", False)
-            element.attrib.pop("data-oe-model", False)
-            element.attrib.pop("data-oe-field", False)
-
         for (attribute_name, attribute_value) in element.attrib.iteritems():
             attribute_name = unicode(attribute_name)
             if attribute_name == "groups":
@@ -770,6 +763,12 @@ class DateTimeConverter(osv.AbstractModel):
 
         return babel.dates.format_datetime(value, format=pattern, locale=locale)
 
+    def record_to_html(self, cr, uid, field_name, record, options, context=None):
+        field = field = record._fields[field_name]
+        value = record[field_name]
+        return self.value_to_html(
+            cr, uid, value, field, options=options, context=dict(context, **record.env.context))
+
 class TextConverter(osv.AbstractModel):
     _name = 'ir.qweb.field.text'
     _inherit = 'ir.qweb.field'
@@ -888,7 +887,7 @@ class MonetaryConverter(osv.AbstractModel):
         lang = self.pool['res.lang']
         formatted_amount = lang.format(cr, uid, [lang_code],
             fmt, Currency.round(cr, uid, display_currency, from_amount),
-            grouping=True, monetary=True)
+            grouping=True, monetary=True).replace(r' ', u'\N{NO-BREAK SPACE}')
 
         pre = post = u''
         if display_currency.position == 'before':
@@ -1050,7 +1049,7 @@ class QwebWidgetMonetary(osv.AbstractModel):
         lang_code = qwebcontext.context.get('lang') or 'en_US'
         formatted_amount = self.pool['res.lang'].format(
             qwebcontext.cr, qwebcontext.uid, [lang_code], fmt, inner, grouping=True, monetary=True
-        )
+        ).replace(r' ', u'\N{NO-BREAK SPACE}')
         pre = post = u''
         if display.position == 'before':
             pre = u'{symbol}\N{NO-BREAK SPACE}'

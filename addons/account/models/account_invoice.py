@@ -69,6 +69,9 @@ class AccountInvoice(models.Model):
 
     @api.model
     def _default_currency(self):
+        if 'default_purchase_id' in self.env.context:
+            purchase_id = self.env.context['default_purchase_id']
+            return self.env['purchase.order'].browse(purchase_id).currency_id
         journal = self._default_journal()
         return journal.currency_id or journal.company_id.currency_id
 
@@ -148,11 +151,13 @@ class AccountInvoice(models.Model):
                 if self.type in ('out_invoice', 'in_refund'):
                     amount = sum([p.amount for p in payment.matched_debit_ids if p.debit_move_id in self.move_id.line_ids])
                     amount_currency = sum([p.amount_currency for p in payment.matched_debit_ids if p.debit_move_id in self.move_id.line_ids])
+                    payment_currency_id = all([p.currency_id == payment.matched_debit_ids[0].currency_id for p in payment.matched_debit_ids]) and payment.matched_debit_ids[0].currency_id or False
                 elif self.type in ('in_invoice', 'out_refund'):
                     amount = sum([p.amount for p in payment.matched_credit_ids if p.credit_move_id in self.move_id.line_ids])
                     amount_currency = sum([p.amount_currency for p in payment.matched_credit_ids if p.credit_move_id in self.move_id.line_ids])
+                    payment_currency_id = all([p.currency_id == payment.matched_credit_ids[0].currency_id for p in payment.matched_credit_ids]) and payment.matched_credit_ids[0].currency_id or False
                 # get the payment value in invoice currency
-                if payment.currency_id and payment.currency_id == self.currency_id:
+                if payment_currency_id and payment_currency_id == self.currency_id:
                     amount_to_show = amount_currency
                 else:
                     amount_to_show = payment.company_id.currency_id.with_context(date=payment.date).compute(amount, self.currency_id)
@@ -180,8 +185,8 @@ class AccountInvoice(models.Model):
     def _compute_payments(self):
         payment_lines = []
         for line in self.move_id.line_ids:
-            payment_lines.extend([rp.credit_move_id.id for rp in line.matched_credit_ids])
-            payment_lines.extend([rp.debit_move_id.id for rp in line.matched_debit_ids])
+            payment_lines.extend(filter(None, [rp.credit_move_id.id for rp in line.matched_credit_ids]))
+            payment_lines.extend(filter(None, [rp.debit_move_id.id for rp in line.matched_debit_ids]))
         self.payment_move_line_ids = self.env['account.move.line'].browse(list(set(payment_lines)))
 
     name = fields.Char(string='Reference/Description', index=True,
@@ -318,9 +323,26 @@ class AccountInvoice(models.Model):
 
     @api.model
     def create(self, vals):
+        onchanges = {
+            '_onchange_partner_id': ['account_id', 'payment_term_id', 'fiscal_position_id', 'partner_bank_id'],
+            '_onchange_journal_id': ['currency_id'],
+        }
+        for onchange_method, changed_fields in onchanges.items():
+            if any(f not in vals for f in changed_fields):
+                invoice = self.new(vals)
+                getattr(invoice, onchange_method)()
+                for field in changed_fields:
+                    if field not in vals and invoice[field]:
+                        vals[field] = invoice._fields[field].convert_to_write(invoice[field])
         if not vals.get('account_id',False):
             raise UserError(_('Configuration error!\nCould not find any account to create the invoice, are you sure you have a chart of account installed?'))
-        return super(AccountInvoice, self.with_context(mail_create_nolog=True)).create(vals)
+
+        invoice = super(AccountInvoice, self.with_context(mail_create_nolog=True)).create(vals)
+
+        if any(line.invoice_line_tax_ids for line in invoice.invoice_line_ids) and not invoice.tax_line_ids:
+            invoice.compute_taxes()
+
+        return invoice
 
     @api.model
     def fields_view_get(self, view_id=None, view_type=False, toolbar=False, submenu=False):
@@ -495,7 +517,17 @@ class AccountInvoice(models.Model):
         self.write({'state': 'draft', 'date': False})
         self.delete_workflow()
         self.create_workflow()
+        # Delete attachments now since an invoice can also be generated when the invoice is cancelled
+        self.env['ir.attachment'].search([('res_model', '=', self._name), ('res_id', 'in', self.ids)]).unlink()
         return True
+
+    @api.multi
+    def get_formview_id(self):
+        """ Update form view id of action to open the invoice """
+        if self.type in ('in_invoice', 'in_refund'):
+            return self.env.ref('account.invoice_supplier_form').id
+        else:
+            return self.env.ref('account.invoice_form').id
 
     @api.multi
     def get_taxes_values(self):
@@ -1060,7 +1092,7 @@ class AccountInvoiceLine(models.Model):
         required=True, domain=[('deprecated', '=', False)],
         default=_default_account,
         help="The income or expense account related to the selected product.")
-    price_unit = fields.Monetary(string='Unit Price', required=True)
+    price_unit = fields.Float(string='Unit Price', required=True, digits=dp.get_precision('Product Price'))
     price_subtotal = fields.Monetary(string='Amount',
         store=True, readonly=True, compute='_compute_price')
     price_subtotal_signed = fields.Monetary(string='Amount Signed', currency_field='company_currency_id',
@@ -1118,7 +1150,8 @@ class AccountInvoiceLine(models.Model):
 
         fix_price = self.env['account.tax']._fix_tax_included_price
         if self.invoice_id.type in ('in_invoice', 'in_refund'):
-            if not self.price_unit or float_compare(self.price_unit, self.product_id.standard_price, precision_digits=self.currency_id.rounding) == 0:
+            prec = self.env['decimal.precision'].precision_get('Product Price')
+            if not self.price_unit or float_compare(self.price_unit, self.product_id.standard_price, precision_digits=prec) == 0:
                 self.price_unit = fix_price(self.product_id.standard_price, taxes, fp_taxes)
         else:
             self.price_unit = fix_price(self.product_id.lst_price, taxes, fp_taxes)
@@ -1222,6 +1255,14 @@ class AccountInvoiceTax(models.Model):
     _description = "Invoice Tax"
     _order = 'sequence'
 
+    def _compute_base_amount(self):
+        for tax in self:
+            base = 0.0
+            for line in tax.invoice_id.invoice_line_ids:
+                if tax.tax_id in line.invoice_line_tax_ids:
+                    base += line.price_subtotal
+            tax.base = base
+
     invoice_id = fields.Many2one('account.invoice', string='Invoice', ondelete='cascade', index=True)
     name = fields.Char(string='Tax Description', required=True)
     tax_id = fields.Many2one('account.tax', string='Tax')
@@ -1232,6 +1273,9 @@ class AccountInvoiceTax(models.Model):
     sequence = fields.Integer(help="Gives the sequence order when displaying a list of invoice tax.")
     company_id = fields.Many2one('res.company', string='Company', related='account_id.company_id', store=True, readonly=True)
     currency_id = fields.Many2one('res.currency', related='invoice_id.currency_id', store=True, readonly=True)
+    base = fields.Monetary(string='Base', compute='_compute_base_amount')
+
+
 
 
 class AccountPaymentTerm(models.Model):
